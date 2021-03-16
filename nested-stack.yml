@@ -1,1 +1,456 @@
 
+WSTemplateFormatVersion: 2010-09-09
+
+Outputs:
+  StackArn:
+    Description: Don't remove this output! Pipelines needs this to do it's association.(And LPT. Removing it will break things)
+    Value:
+      Ref: AWS::StackId
+Description: Stack for CloudWatchMetrics Load
+
+Parameters:
+  Stage: {Type: String, Default: 'beta'}
+  DirsToCreate:
+    Description: "S3 Bucket Objects"
+    Default: "r2e,selfserviceexport"
+    Type: CommaDelimitedList
+
+Mappings:
+  beta:
+    S3BucketMetrics: { Name: "test1121212128198883343431212" }
+  gamma:
+    S3BucketMetrics: { Name: "test1121212128198883343431212" }
+  prod:
+    S3BucketMetrics: { Name: "test1121212128198883343431212" }
+
+Resources:
+  #1. Bucket for metrics data from redshift
+  S3BucketForCWMetrics:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: {"Fn::FindInMap" : [{"Ref": "Stage"}, "S3BucketMetrics", "Name"]}
+      VersioningConfiguration: 
+        Status: Enabled
+      BucketEncryption:
+        #Server-Side Encryption with Amazon S3-Managed Keys (SSE-S3)
+        ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt [ CloudWatchUpdateLambda, Arn]
+
+  #2. Creating custom resource to add directories under the above S3.
+  S3CustomResource:
+    Type: Custom::S3CustomResource
+    Properties:
+      ServiceToken: !GetAtt LambdaCustomS3ObjectCreate.Arn
+      the_bucket: !Ref S3BucketForCWMetrics
+      dirs_to_create: !Ref DirsToCreate
+
+  #Lamabda to create objects inside S3.
+  LambdaCustomS3ObjectCreate:
+    Type: "AWS::Lambda::Function"
+    DependsOn: [IAMRoleForLambdaCustomS3ObjectCreate]
+    Properties:
+      Description: "Lambda to Create Objects under S3; with objects name as deliverable name"
+      FunctionName: LambdaCustomS3ObjectCreate
+      Handler: index.handler
+      Role: !GetAtt IAMRoleForLambdaCustomS3ObjectCreate.Arn
+      Timeout: 300
+      MemorySize: 3008
+      Runtime: python3.6
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              # Init ...
+              the_event = event['RequestType']
+              print("The event is: ", str(the_event))
+              response_data = {}
+              s_3 = boto3.client('s3')
+              # Retrieve parameters
+              the_bucket = event['ResourceProperties']['the_bucket']
+              dirs_to_create = event['ResourceProperties']['dirs_to_create']
+              try:
+                  if the_event in ('Create', 'Update'):
+                      print("Requested folders: ", str(dirs_to_create))
+                      for dir_name in dirs_to_create:
+                          print("Creating: ", str(dir_name))
+                          s_3.put_object(Bucket=the_bucket,
+                                         Key=(dir_name
+                                              + '/'))
+                  elif the_event == 'Delete':
+                      print("Deleting S3 content...")
+                      b_operator = boto3.resource('s3')
+                      b_operator.Bucket(str(the_bucket)).objects.all().delete()
+                  # Everything OK... send the signal back
+                  print("Execution succesfull!")
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.SUCCESS,
+                                   response_data)
+              except Exception as e:
+                  print("Execution failed...")
+                  print(str(e))
+                  response_data['Data'] = str(e)
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.FAILED,
+                                   response_data)
+  IAMRoleForLambdaCustomS3ObjectCreate:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IAMRoleForLambdaCustomS3ObjectCreate
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+            Version: '2012-10-17'
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-CW
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:List*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketForCWMetrics}/*
+                  - !Sub arn:aws:s3:::${S3BucketForCWMetrics}
+            Version: '2012-10-17'
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-S3
+
+  #3. IAM role for CloudWatchUpdateLambda for Cloudwatch Metrics
+  IAMRoleForCloudWatchUpdateLambda:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IAMRoleForCloudWatchUpdateLambda
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      Tags:
+        - Key: "StackName"
+          Value: !Ref "AWS::StackName"
+
+  #4. Lambda permissions to S3
+  LambdaInvokePermissionsOnS3event:
+    Type: AWS::Lambda::Permission
+    DependsOn: CloudWatchUpdateLambda
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - CloudWatchUpdateLambda
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Join:
+          -  ":"
+          - - "arn:aws:s3::"
+            - {"Fn::FindInMap" : [{"Ref": "Stage"}, "S3BucketMetrics", "Name"]}
+
+  #5. Lambda to update CW Dashboard.
+  CloudWatchUpdateLambda:
+    #Lambda to capture events pushed by data deliverables and push it to CW.
+    Type: "AWS::Lambda::Function"
+    DependsOn: [IAMRoleForCloudWatchUpdateLambda]
+    Properties:
+      Description: "Lambda to capture S3 events and push to cloudwatch"
+      FunctionName: 'HawkeyeCloudWatchMetricsLoad'
+      Handler: index.handler
+      Role: !GetAtt IAMRoleForCloudWatchUpdateLambda.Arn
+      Timeout: 300
+      MemorySize: 3008
+      Runtime: python3.6
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import boto3
+          print('Loading function')
+          s3 = boto3.client('s3')
+          cloudwatch = boto3.client('cloudwatch')
+          def handler(event, context):
+              #print("Received event: " + json.dumps(event, indent=2))
+              # Get the object from the event and show its content type
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              try:
+                  response_s3 = s3.get_object(Bucket=bucket, Key=key)
+                  print("bucket name" + str(bucket))
+                  print("CONTENT TYPE: " + response_s3['ContentType'])
+                  # open the file object and read it into the variable filedata.
+                  filedata = response_s3['Body'].read()
+                  # file data will be a binary stream.  We have to decode it
+                  contents = filedata.decode('utf-8')
+                  if contents:
+                      # Step for Availability
+                      deliverableName=contents.split("|")[0]
+                      batchID=contents.split("|")[1]
+                      metricValue=contents.split("|")[2]
+                      latency=contents.split("|")[3]
+                      response_unavailabilityMetric = cloudwatch.put_metric_data(
+                                      Namespace='CustomRunTimeMetrics',
+                                      MetricData=[
+                                                  {
+                                              'MetricName': 'UnavailableInMins',
+                                              'Dimensions': [
+                                                              {   'Name': 'ByDeliverableName',
+                                                                  'Value': deliverableName
+                                                              },
+                                                            ],
+                                              'Value': int(metricValue)
+                                                  },
+                                                  ]
+                                              )
+                      print(response_unavailabilityMetric)
+                      # Step for Latency
+                      response_latencyMetric = cloudwatch.put_metric_data(
+                                      Namespace='CustomRunTimeMetrics',
+                                      MetricData=[
+                                                  {
+                                              'MetricName': 'LatencyInMins',
+                                              'Dimensions': [
+                                                              {   'Name': 'ByDeliverableName',
+                                                                  'Value': deliverableName
+                                                              },
+                                                            ],
+                                              'Value': int(latency)
+                                                  },
+                                                  {
+                                              'MetricName': 'BatchID',
+                                              'Dimensions': [
+                                                              {   'Name': 'ByDeliverableName',
+                                                                  'Value': deliverableName
+                                                              },
+                                                            ],
+                                              'Value': int(batchID)
+                                                  },
+                                                  ]
+                                              )
+                      print(response_latencyMetric)
+                      print("Exiting Cloudwatch step")
+                  return response_s3['ContentType']
+              except Exception as e:
+                  print(e)
+                  print('Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.'.format(key, bucket))
+                  raise e
+  #6. CW Dashboard for metrics.
+  CWDashboardDeliverables:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Frontier-Datateam-Deliverables1
+      DashboardBody: !Sub >-
+        {
+        "start": "-P1W",
+        "periodOverride": "inherit",
+        "widgets": [
+        {
+          "type": "metric",
+          "x": 0,
+          "y": 1,
+          "width": 9,
+          "height": 3,
+          "properties": {
+              "metrics": [
+                  [ { "expression": "(1-e2)*100", "label": "Availability (TotalAvaiableMins/WindowDurationInMins)", "id": "e3", "region": "us-west-2" } ],
+                  [ { "expression": "FILL(e1,0)", "label": "Replacing it with zero, if no data from id 'e1'", "id": "e2", "region": "us-west-2", "visible": false } ],
+                  [ { "expression": "m1/(PERIOD(m1)/60)", "label": "UnavailableRate (UnavaialbeMins/DurationInMinsOfPeriodChoosen)", "id": "e1", "region": "us-west-2", "visible": false } ],
+                  [ "CustomRunTimeMetrics", "UnavailableInMins", "ByDeliverableName", "r2e", { "period": 1, "id": "m1", "visible": false } ]
+              ],
+              "view": "singleValue",
+              "region": "us-west-2",
+              "period": 604800,
+              "stacked": false,
+              "stat": "Sum",
+              "setPeriodToTimeRange": true,
+              "singleValueFullPrecision": true,
+              "title": "R2E Deliverable Availability"
+          }
+          },
+        {
+          "type": "metric",
+          "x": 9,
+          "y": 1,
+          "width": 9,
+          "height": 3,
+          "properties": {
+              "metrics": [
+                  [ { "expression": "(1-e2)*100", "label": "Availability (TotalAvaiableMins/WindowDurationInMins)", "id": "e3", "region": "us-west-2" } ],
+                  [ { "expression": "FILL(e1,0)", "label": "Replacing it with zero, if no data from id 'e1'", "id": "e2", "region": "us-west-2", "visible": false } ],
+                  [ { "expression": "m1/(PERIOD(m1)/60)", "label": "UnavailableRate (UnavaialbeMins/DurationInMinsOfPeriodChoosen)", "id": "e1", "region": "us-west-2", "visible": false } ],
+                  [ "CustomRunTimeMetrics", "UnavailableInMins", "ByDeliverableName", "selfserviceexport", { "period": 1, "id": "m1", "visible": false } ]
+              ],
+              "view": "singleValue",
+              "region": "us-west-2",
+              "period": 604800,
+              "stacked": false,
+              "stat": "Sum",
+              "setPeriodToTimeRange": true,
+              "singleValueFullPrecision": true,
+              "title": "SelfServiceExport Deliverable Availability"
+          }
+        },
+        {
+          "type": "metric",
+          "x": 9,
+          "y": 5,
+          "width": 9,
+          "height": 6,
+          "properties": {
+              "metrics": [
+                  [ "CustomRunTimeMetrics", "LatencyInMins", "ByDeliverableName", "selfserviceexport" ],
+                  [ ".", "BatchID", ".", "." ]
+              ],
+              "annotations": {
+                  "horizontal": [
+                      {
+                          "label": "SLA",
+                          "value": 60
+                      }
+                  ]
+              },
+              "view": "timeSeries",
+              "stacked": false,
+              "region": "us-west-2",
+              "title": "SelfServiceExport Deliverable Latency (Minutes)",
+              "period": 60,
+              "yAxis": {
+                  "left": {
+                      "showUnits": false
+                  }
+              }
+          }
+          },
+         {
+          "type": "metric",
+          "x": 0,
+          "y": 5,
+          "width": 9,
+          "height": 6,
+          "properties": {
+              "metrics": [
+                  [ "CustomRunTimeMetrics", "LatencyInMins", "ByDeliverableName", "r2e" ],
+                  [ ".", "BatchID", ".", "." ]
+              ],
+              "annotations": {
+                  "horizontal": [
+                      {
+                          "label": "SLA",
+                          "value": 180
+                      }
+                  ]
+              },
+              "view": "timeSeries",
+              "stacked": false,
+              "region": "us-west-2",
+              "title": "R2E Deliverable Latency (Minutes)",
+              "period": 60,
+              "yAxis": {
+                  "left": {
+                      "showUnits": false
+                  }
+              }
+          }
+          },
+          {
+          "type": "text",
+          "x": 0,
+          "y": 0,
+          "width": 18,
+          "height": 1,
+          "properties": {
+              "markdown": "\n# **Availability** \n"
+          }
+          },
+        {
+          "type": "text",
+          "x": 0,
+          "y": 4,
+          "width": 18,
+          "height": 1,
+          "properties": {
+              "markdown": "\n# **Latency**\n"
+          }
+        }
+        ]
+        }
+  CWDashboardRedshift:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Frontier-RedShift-Metrics1
+      DashboardBody: !Sub >-
+        {
+        "start": "-P1W",
+        "periodOverride": "inherit",
+        "widgets": [
+        {
+        "type": "metric",
+        "x": 0,
+        "y": 0,
+        "width": 6,
+        "height": 6,
+        "properties": {
+            "view": "singleValue",
+            "metrics": [
+                [ "AWS/Redshift", "CPUUtilization", "ClusterIdentifier", "hawkeye-gamma-testbed" ]
+            ],
+            "region": "us-west-2"
+        }
+        },
+        {
+        "type": "metric",
+        "x": 6,
+        "y": 0,
+        "width": 6,
+        "height": 6,
+        "properties": {
+            "view": "singleValue",
+            "metrics": [
+                [ "AWS/Redshift", "PercentageDiskSpaceUsed", "ClusterIdentifier", "hawkeye-gamma-testbed" ]
+            ],
+            "region": "us-west-2"
+        }
+        },
+        {
+        "type": "metric",
+        "x": 0,
+        "y": 6,
+        "width": 6,
+        "height": 6,
+        "properties": {
+            "view": "singleValue",
+            "metrics": [
+                [ "AWS/Redshift", "HealthStatus", "ClusterIdentifier", "hawkeye-gamma-testbed" ]
+            ],
+            "region": "us-west-2"
+        }
+        }
+        ]
+        }
