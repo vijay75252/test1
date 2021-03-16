@@ -1,0 +1,18 @@
+Outputs:
+  StackArn:
+    Description: Don't remove this output! Pipelines needs this to do its association. (And LPT. Removing it will break things)
+    Value: {Ref: 'AWS::StackId'}
+Parameters:
+  Stage: {Type: String, Default: 'beta'}
+
+  
+AWSTemplateFormatVersion: 2010-09-09
+Description: Working with custom resources and S3!
+Resources:      
+  NestedStackForCloudWatchMetrics:
+    Type: AWS::CloudFormation::Stack
+    Metadata: {Comment: Stack for CloudWatchMetrics Resource Creation}
+    Properties:
+      Parameters:
+        Stage: {Ref: Stage}
+      TemplateURL: https://s3.amazonaws.com/codedeploybucket895/test2.yml
